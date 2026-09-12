@@ -1,8 +1,11 @@
 "use client";
 
-import { useAccount, useReadContract, useBalance } from "wagmi";
-import { useState, useEffect } from "react";
+import { useAccount, useReadContract, useBalance, usePublicClient } from "wagmi";
+import { useState, useEffect, useCallback } from "react";
 import { CONTRACTS } from "@/config/wagmi";
+import { fetchAuthorizationsByLp, isLocalChain, subgraphUrlFor } from "@/lib/subgraph";
+import { readTape } from "@/lib/tape";
+import type { PublicClient, Address } from "viem";
 import type { ActiveAuth } from "@/components/AuthorizeRange";
 
 const VAULT_ABI = [
@@ -23,17 +26,117 @@ const VAULT_ABI = [
       { name: "active", type: "bool" },
     ],
   },
+  {
+    name: "RangeAuthorized",
+    type: "event",
+    inputs: [
+      { name: "authId", type: "uint256", indexed: true },
+      { name: "lp", type: "address", indexed: true },
+      { name: "strikeMin", type: "uint256", indexed: false },
+      { name: "strikeMax", type: "uint256", indexed: false },
+      { name: "expiry", type: "uint256", indexed: false },
+      { name: "isCall", type: "bool", indexed: false },
+      { name: "maxCollateral", type: "uint256", indexed: false },
+    ],
+  },
 ] as const;
 
-interface LPDashboardProps {
-  activeAuth?: ActiveAuth | null;
-}
-
-export function LPDashboard({ activeAuth }: LPDashboardProps) {
-  const { address, isConnected } = useAccount();
+export function LPDashboard() {
+  const { address, isConnected, chainId } = useAccount();
+  const publicClient = usePublicClient();
   const [mounted, setMounted] = useState(false);
+  // The connected wallet's own most-recently-authorized *active* range.
+  // Read from the subgraph (one indexed query — always present on Sepolia /
+  // Arc, see lib/subgraph.ts), or on the local Anvil chain only via getLogs
+  // on `RangeAuthorized`'s indexed `lp` topic, since no graph-node runs
+  // there. Distinct
+  // from app/page.tsx's `activeAuth`, which tracks the market-wide latest
+  // authorization (any LP) for the buyer-facing option chain — see
+  // docs/limitations.md L12a for why these can't share one piece of state.
+  const [myAuth, setMyAuth] = useState<ActiveAuth | null>(null);
+  // Instruments this wallet has written that still have open interest — a
+  // real count from the tape (subgraph on public chains, event log on Anvil).
+  const [activeCount, setActiveCount] = useState<number | null>(null);
   useEffect(() => { setMounted(true); }, []);
+  useEffect(() => {
+    if (!address || !chainId) { setActiveCount(null); return; }
+    let cancelled = false;
+    readTape({ chainId, client: publicClient as PublicClient | undefined, vault: (CONTRACTS.aquaVault || undefined) as Address | undefined })
+      .then((tape) => {
+        if (cancelled) return;
+        const me = address.toLowerCase();
+        setActiveCount(tape.instruments.filter((i) => i.lp.toLowerCase() === me && i.openInterest > 0).length);
+      })
+      .catch(() => { if (!cancelled) setActiveCount(null); });
+    return () => { cancelled = true; };
+  }, [address, chainId, publicClient, myAuth]);
 
+  const refreshMyAuth = useCallback(async () => {
+    if (!publicClient || !address || !CONTRACTS.aquaVault) { setMyAuth(null); return; }
+    const url = subgraphUrlFor(chainId);
+    if (url) {
+      try {
+        const live = (await fetchAuthorizationsByLp(address, url)).find((r) => r.active);
+        setMyAuth(
+          live
+            ? {
+                authId: BigInt(live.authId),
+                strikeMin: Number(live.strikeMin) / 1e18,
+                strikeMax: Number(live.strikeMax) / 1e18,
+                expiry: Number(live.expiry),
+                isCall: live.isCall,
+                lp: live.lp,
+                collateralToken: live.collateralToken,
+              }
+            : null
+        );
+        return;
+      } catch {
+        // Indexer unreachable — on a public network there is nothing else to
+        // read from; on Anvil fall through to the event scan.
+        if (!isLocalChain(chainId)) { setMyAuth(null); return; }
+      }
+    }
+    const logs = await publicClient.getLogs({
+      address: CONTRACTS.aquaVault as `0x${string}`,
+      event: VAULT_ABI[1],
+      args: { lp: address },
+      fromBlock: BigInt(0),
+      toBlock: "latest",
+    });
+    const authIds = Array.from(new Set(logs.map((l) => l.args.authId as bigint)))
+      .sort((a, b) => (a > b ? -1 : a < b ? 1 : 0));
+    for (const authId of authIds) {
+      const auth = await publicClient.readContract({
+        address: CONTRACTS.aquaVault as `0x${string}`,
+        abi: VAULT_ABI,
+        functionName: "authorizations",
+        args: [authId],
+      });
+      const [lp, strikeMinWAD, strikeMaxWAD, expiry, , , collateralToken, isCall, active] = auth;
+      if (active) {
+        setMyAuth({
+          authId,
+          strikeMin: Number(strikeMinWAD) / 1e18,
+          strikeMax: Number(strikeMaxWAD) / 1e18,
+          expiry: Number(expiry),
+          isCall,
+          lp,
+          collateralToken,
+        });
+        return;
+      }
+    }
+    setMyAuth(null);
+  }, [publicClient, address, chainId]);
+
+  useEffect(() => {
+    refreshMyAuth();
+    const id = setInterval(refreshMyAuth, 8000);
+    return () => clearInterval(id);
+  }, [refreshMyAuth]);
+
+  const activeAuth = myAuth;
   const { data: ethBalance } = useBalance({ address });
 
   const { data: auth } = useReadContract({
@@ -177,8 +280,8 @@ export function LPDashboard({ activeAuth }: LPDashboardProps) {
         />
         <Stat
           label="Active Positions"
-          value={usedCollateral !== null && usedCollateral > 0 ? "≥1" : "0"}
-          sub="Options sold · collateral locked"
+          value={activeCount !== null ? String(activeCount) : usedCollateral !== null && usedCollateral > 0 ? "≥1" : "—"}
+          sub={activeCount !== null ? "Instruments you wrote with open interest" : "Options sold · collateral locked"}
         />
       </div>
     </div>

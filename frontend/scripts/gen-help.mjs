@@ -72,8 +72,19 @@ const readDoc = (relPath) => readFileSync(join(repoRoot, relPath), "utf8");
 
 const pages = [
   { id: "overview", label: "Overview", source: "README.md", mermaid: true },
+  { id: "guide", label: "User Guide", source: "docs/guide.md", mermaid: false },
+  { id: "screens", label: "Screens", source: "docs/screens.md", mermaid: false },
   { id: "limitations", label: "Limitations", source: "docs/limitations.md", mermaid: false },
   { id: "solutions", label: "Solutions", source: "docs/solutions.md", mermaid: false },
+  { id: "copilot", label: "AI Copilot", source: "docs/copilot.md", mermaid: false },
+  // Sponsor pages: one per protocol Smile is built on — features used, why,
+  // value add, technical details, limitations, plans, glossary.
+  { id: "aqua", label: "1inch Aqua", source: "docs/sponsors/aqua.md", mermaid: false, group: "Sponsors" },
+  { id: "chainlink", label: "Chainlink", source: "docs/sponsors/chainlink.md", mermaid: false },
+  { id: "uniswap", label: "Uniswap", source: "docs/sponsors/uniswap.md", mermaid: false },
+  { id: "thegraph", label: "The Graph", source: "docs/sponsors/thegraph.md", mermaid: false },
+  { id: "arc", label: "Circle · Arc", source: "docs/sponsors/arc.md", mermaid: false },
+  { id: "frontend", label: "Frontend", source: "docs/sponsors/frontend.md", mermaid: false },
 ];
 
 // Every doc (not just the README) goes through extractMath first, so KaTeX
@@ -87,16 +98,27 @@ const renderDoc = (relPath) => {
 
 const pageHtml = Object.fromEntries(pages.map((p) => [p.id, renderDoc(p.source)]));
 
-// The Reference Table is its own standalone interactive document (filters,
-// cross-reference scrolling) — copy it next to help.html and embed via
-// iframe rather than inlining its markup, so its CSS/JS can't collide with
-// the wiki shell's.
+// Standalone interactive documents (filters, cross-reference scrolling) —
+// copied next to help.html and embedded via iframe rather than inlined, so
+// their own CSS/JS can't collide with the wiki shell's.
+const standalonePages = [
+  { id: "reference", label: "Reference Table", file: "reference-table.html", title: "Smile reference table" },
+  {
+    id: "continuation-track",
+    label: "Continuation Track",
+    file: "continuation-track-reference.html",
+    title: "Smile Continuation Track reference",
+  },
+];
+
 mkdirSync(publicDir, { recursive: true });
-copyFileSync(join(repoRoot, "docs", "reference-table.html"), join(publicDir, "reference-table.html"));
+for (const sp of standalonePages) {
+  copyFileSync(join(repoRoot, "docs", sp.file), join(publicDir, sp.file));
+}
 
 const sidebarLinks = [
-  ...pages.map((p) => `<button class="nav-link" data-page="${p.id}">${p.label}</button>`),
-  `<button class="nav-link" data-page="reference">Reference Table</button>`,
+  ...pages.map((p) => `${p.group ? `<h3>${p.group}</h3>` : ""}<button class="nav-link" data-page="${p.id}">${p.label}</button>`),
+  ...standalonePages.map((sp) => `<button class="nav-link" data-page="${sp.id}">${sp.label}</button>`),
 ].join("\n        ");
 
 const pageSections = [
@@ -105,9 +127,11 @@ const pageSections = [
       <article class="doc">${pageHtml[p.id]}</article>
     </section>`
   ),
-  `<section id="page-reference" class="page page-reference">
-      <iframe src="${basePath}/reference-table.html" title="Smile reference table" loading="lazy"></iframe>
-    </section>`,
+  ...standalonePages.map(
+    (sp) => `<section id="page-${sp.id}" class="page page-reference">
+      <iframe src="${basePath}/${sp.file}" title="${sp.title}" loading="lazy"></iframe>
+    </section>`
+  ),
 ].join("\n    ");
 
 const html = `<!doctype html>
@@ -144,6 +168,13 @@ const html = `<!doctype html>
     margin: 0 12px 16px;
     letter-spacing: 0.02em;
   }
+  .sidebar h3 {
+    color: #6b7280;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin: 16px 12px 6px;
+  }
   .nav-link {
     display: block;
     width: 100%;
@@ -164,6 +195,7 @@ const html = `<!doctype html>
   .page { display: none; }
   .page.active { display: block; }
   .doc { max-width: 880px; margin: 0 auto; padding: 48px 24px 96px; }
+  .doc a[id^="tab-"] { display: block; scroll-margin-top: 16px; }
   .page-reference { height: 100vh; }
   .page-reference iframe { width: 100%; height: 100%; border: none; display: block; }
   h1, h2, h3, h4 { color: #fff; font-weight: 700; line-height: 1.25; margin: 1.8em 0 0.6em; }
@@ -205,7 +237,7 @@ const html = `<!doctype html>
       overflow-x: auto;
       padding: 12px;
     }
-    .sidebar h2 { display: none; }
+    .sidebar h2, .sidebar h3 { display: none; }
     .nav-link { width: auto; white-space: nowrap; margin-right: 4px; margin-bottom: 0; }
     .page-reference { height: 80vh; }
   }
@@ -226,7 +258,7 @@ const html = `<!doctype html>
     // mermaid import below never resolves (offline, blocked, jsDelivr down).
     // A failed top-level ES module import aborts the ENTIRE module, so
     // mermaid is loaded separately, dynamically, with its own try/catch.
-    var VALID_PAGES = ${JSON.stringify([...pages.map((p) => p.id), "reference"])};
+    var VALID_PAGES = ${JSON.stringify([...pages.map((p) => p.id), ...standalonePages.map((sp) => sp.id)])};
     var mermaidDone = new Set();
     var mermaidReady = null; // Promise<mermaid module> | null, set below
 
@@ -252,7 +284,9 @@ const html = `<!doctype html>
       catch (e) { console.error("mermaid render failed", e); }
     }
 
-    function showPage(id) {
+    // Hash forms: "#page" or "#page/anchor" — the app's Help link uses
+    // "#screens/tab-<id>" to land on the section for the tab in view.
+    function showPage(id, anchor) {
       if (VALID_PAGES.indexOf(id) === -1) id = VALID_PAGES[0];
       document.querySelectorAll(".page").forEach(function (el) { el.classList.remove("active"); });
       document.querySelectorAll(".nav-link").forEach(function (el) { el.classList.remove("active"); });
@@ -260,14 +294,25 @@ const html = `<!doctype html>
       section.classList.add("active");
       document.querySelector('.nav-link[data-page="' + id + '"]').classList.add("active");
       renderMermaidIn(section);
-      history.replaceState(null, "", "#" + id);
+      history.replaceState(null, "", "#" + id + (anchor ? "/" + anchor : ""));
+      if (anchor) {
+        var target = document.getElementById(anchor);
+        if (target) requestAnimationFrame(function () { target.scrollIntoView({ block: "start" }); });
+      } else {
+        window.scrollTo(0, 0);
+      }
+    }
+    function showHash(hash) {
+      var parts = (hash || "#overview").slice(1).split("/");
+      showPage(parts[0], parts[1]);
     }
 
     document.querySelectorAll(".nav-link").forEach(function (btn) {
       btn.addEventListener("click", function () { showPage(btn.dataset.page); });
     });
 
-    showPage((location.hash || "#overview").slice(1));
+    showHash(location.hash);
+    window.addEventListener("hashchange", function () { showHash(location.hash); });
 
     // Best-effort mermaid load — never blocks navigation or page rendering.
     mermaidReady = import("https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs")
